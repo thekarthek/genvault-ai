@@ -1,0 +1,47 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+
+# Least-privilege default token scope for every job.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: zizmor (GitHub Actions security audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # upload SARIF to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: pip install zizmor
+      - name: Run zizmor
+        # Surface findings in code scanning without blocking CI while the backlog
+        # is worked down; the SARIF upload below records them either way.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format sarif .github/workflows/ > zizmor.sarif
+      - name: Upload SARIF to code scanning
+        # Skip on fork PRs: GITHUB_TOKEN can't be granted security-events: write there (zizmor still runs above).
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81  # v3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor

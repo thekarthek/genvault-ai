@@ -1,0 +1,14 @@
+<!-- last_verified: 2026-05-11 -->
+# Genblaze — Claude Code Config
+
+- Follow [AGENTS.md](AGENTS.md) at all times
+- Read order: README.md → ARCHITECTURE.md → AGENTS.md → relevant feature doc
+- Plans go in `docs/exec-plans/active/`
+- Test commands: `make test` (full-suite gate), `/test-package <name>` (one package), `/test-package changed` (only changed packages)
+- Quick single-file run: `cd libs/core && pytest tests/unit/<file>.py -v`
+- Lint: `make lint`. Python edits are auto-formatted via `.claude/hooks/auto-format.sh`.
+- Always run `make test` before considering work complete
+- Update docs in the same PR as code changes
+- Keep diffs minimal — only change what's needed
+- Adding a new connector: use `/scaffold-provider`. Before tagging a release: run `make pre-release` and read [RELEASING.md](RELEASING.md). After publish: `make post-release VERSION=<umbrella-version>`. Auditing docs freshness: `/verify-docs`.
+- Release flow: tag name follows the CHANGELOG wave header (`v0.3.0`), not any single package's version. Workflow at `.github/workflows/release.yml` triggers on GitHub Release creation; `workflow_dispatch` runs a TestPyPI dry-run.

@@ -1,0 +1,162 @@
+"""JPEG media handler — embed/extract manifests via XMP metadata."""
+
+from __future__ import annotations
+
+import html
+import json
+import os
+from pathlib import Path
+
+from PIL import Image
+
+from genblaze_core.exceptions import EmbeddingError
+from genblaze_core.media.base import (
+    BaseMediaHandler,
+    MediaCapability,
+    atomic_write,
+    read_media_bytes,
+)
+from genblaze_core.models.manifest import Manifest, parse_manifest
+
+XMP_NS = "genblaze"
+MAX_XMP_BYTES = 60 * 1024  # 60KB size guard
+
+
+def _build_xmp(manifest_json: str) -> bytes:
+    """Build an XMP packet containing the manifest JSON (XML-escaped)."""
+    # XML-escape manifest JSON to prevent tag injection from prompt content
+    escaped = html.escape(manifest_json, quote=False)
+    xmp = (
+        '<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        f'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"'
+        f' xmlns:mf="https://github.com/backblaze-labs/genblaze/ns/1.0/">'
+        f'<rdf:Description rdf:about="">'
+        f"<mf:manifest>{escaped}</mf:manifest>"
+        f"</rdf:Description>"
+        f"</rdf:RDF>"
+        f"</x:xmpmeta>"
+        '<?xpacket end="w"?>'
+    )
+    return xmp.encode("utf-8")
+
+
+def _extract_from_xmp(xmp_bytes: bytes) -> str:
+    """Extract manifest JSON from XMP bytes (XML-unescaped)."""
+    xmp_str = xmp_bytes.decode("utf-8")
+    start_tag = "<mf:manifest>"
+    end_tag = "</mf:manifest>"
+    start = xmp_str.find(start_tag)
+    end = xmp_str.find(end_tag)
+    if start == -1 or end == -1:
+        raise EmbeddingError("No genblaze manifest found in XMP data")
+    content_start = start + len(start_tag)
+    if end <= content_start:
+        raise EmbeddingError("Malformed XMP: manifest end tag before content start")
+    raw = xmp_str[content_start:end]
+    return html.unescape(raw)
+
+
+def _scan_xmp_for_manifest(data: bytes, source: Path) -> str:
+    """Walk every XMP packet in ``data`` looking for one with our manifest.
+
+    JPEG/WebP files can carry multiple XMP packets — Photoshop, Lightroom,
+    or any other tool may have written XMP into the asset before genblaze
+    embedded its own. Returning on the first packet would incorrectly fail
+    when the leading packet has no ``<mf:manifest>``. Walking the file lets
+    a genblaze packet later in the stream still be found.
+    """
+    pos = 0
+    last_extract_error: EmbeddingError | None = None
+    while True:
+        xmp_start = data.find(b"<x:xmpmeta", pos)
+        if xmp_start == -1:
+            break
+        xpacket_end_marker = data.find(b"<?xpacket end", xmp_start)
+        if xpacket_end_marker == -1:
+            break
+        close_pos = data.find(b"?>", xpacket_end_marker)
+        if close_pos == -1:
+            raise EmbeddingError(f"Malformed XMP packet in {source}: missing closing '?>'")
+        xmp_end = close_pos + 2
+        try:
+            return _extract_from_xmp(data[xmp_start:xmp_end])
+        except EmbeddingError as exc:
+            last_extract_error = exc
+            pos = xmp_end
+            continue
+
+    if last_extract_error is not None:
+        # XMP packets exist but none carried a genblaze manifest. Surface the
+        # specific reason from the last attempt so callers see the real cause.
+        raise EmbeddingError(
+            f"No genblaze manifest in any XMP packet in {source}: {last_extract_error}"
+        )
+    raise EmbeddingError(f"No XMP data found in {source}")
+
+
+class JpegHandler(BaseMediaHandler):
+    """Embed and extract manifests in JPEG XMP metadata."""
+
+    def embed(
+        self,
+        source: str | os.PathLike[str],
+        manifest: Manifest,
+        output: str | os.PathLike[str] | None = None,
+    ) -> Path:
+        try:
+            # Coerce both source= and output= — either being a bare str
+            # would leak into the -> Path contract below (#225).
+            source = Path(source)
+            output = Path(output) if output else source
+            manifest_json = manifest.to_canonical_json()
+            xmp_data = _build_xmp(manifest_json)
+            if len(xmp_data) > MAX_XMP_BYTES:
+                raise EmbeddingError(
+                    f"Manifest too large for JPEG XMP ({len(xmp_data)} bytes > {MAX_XMP_BYTES}). "
+                    "Use sidecar fallback."
+                )
+            with Image.open(source) as img:
+                save_kwargs: dict = {
+                    "xmp": xmp_data,
+                    "exif": img.info.get("exif", b""),
+                    "quality": "keep",
+                }
+                # Preserve color/density metadata when present.
+                if icc := img.info.get("icc_profile"):
+                    save_kwargs["icc_profile"] = icc
+                if dpi := img.info.get("dpi"):
+                    save_kwargs["dpi"] = dpi
+                with atomic_write(output) as tmp:
+                    img.save(tmp, "JPEG", **save_kwargs)
+            return output
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Failed to embed manifest in JPEG: {exc}") from exc
+
+    def extract(self, source: str | os.PathLike[str]) -> Manifest:
+        try:
+            source = Path(source)
+            data = read_media_bytes(source)
+            manifest_json = _scan_xmp_for_manifest(data, source)
+            return parse_manifest(json.loads(manifest_json))
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Failed to extract manifest from JPEG: {exc}") from exc
+
+    @staticmethod
+    def capabilities() -> list[str]:
+        return ["image/jpeg"]
+
+    @staticmethod
+    def media_capabilities() -> list[MediaCapability]:
+        return [
+            MediaCapability(
+                mime_type="image/jpeg",
+                max_payload_bytes=MAX_XMP_BYTES,
+                metadata_location="XMP",
+                strip_risk="medium",
+            )
+        ]

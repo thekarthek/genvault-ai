@@ -1,0 +1,138 @@
+"""Tests for sidecar media handler."""
+
+import json
+from pathlib import Path
+
+import pytest
+from genblaze_core.exceptions import EmbeddingError
+from genblaze_core.media.sidecar import PointerSidecarError, SidecarHandler
+from genblaze_core.models import Manifest
+from genblaze_core.models.enums import PromptVisibility, StepStatus
+from genblaze_core.models.policy import EmbedPolicy
+from genblaze_core.models.run import Run
+from genblaze_core.models.step import Step
+
+
+def test_embed_creates_sidecar(tmp_path: Path, sample_manifest: Manifest) -> None:
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    handler = SidecarHandler()
+    result = handler.embed(src, sample_manifest)
+    assert result == tmp_path / "image.png.genblaze.json"
+    assert result.exists()
+
+
+def test_extract_from_sidecar(tmp_path: Path, sample_manifest: Manifest) -> None:
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    handler = SidecarHandler()
+    handler.embed(src, sample_manifest)
+    extracted = handler.extract(src)
+    assert extracted.canonical_hash == sample_manifest.canonical_hash
+
+
+def test_embed_and_extract_accept_str_path(tmp_path: Path, sample_manifest: Manifest) -> None:
+    """_sidecar_path() calls Path.with_suffix() — same class of bug as #225's
+    Mp4Handler, since SmartEmbedder's fallback and direct callers may pass str."""
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    handler = SidecarHandler()
+    handler.embed(str(src), sample_manifest)
+    extracted = handler.extract(str(src))
+    assert extracted.canonical_hash == sample_manifest.canonical_hash
+
+
+def test_embed_accepts_str_output_override(tmp_path: Path, sample_manifest: Manifest) -> None:
+    """_sidecar_path(output or source) — the output= str branch, not just
+    source=, must also be coerced (embed()'s `output or source` ternary)."""
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+    out = tmp_path / "renamed.png"
+
+    handler = SidecarHandler()
+    result = handler.embed(src, sample_manifest, output=str(out))
+    assert result == out.with_suffix(out.suffix + ".genblaze.json")
+    assert result.exists()
+
+
+def test_extract_from_sidecar_uses_parse_manifest_invariants(tmp_path: Path) -> None:
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+    step = Step(
+        provider="test",
+        model="test-model",
+        prompt="secret",
+        prompt_visibility=PromptVisibility.ENCRYPTED,
+        status=StepStatus.SUCCEEDED,
+    )
+    manifest = Manifest.from_run(Run(name="encrypted", steps=[step]))
+    sidecar = src.with_suffix(src.suffix + ".genblaze.json")
+    sidecar.write_text(manifest.to_canonical_json(), encoding="utf-8")
+
+    with pytest.raises(EmbeddingError, match="encrypted"):
+        SidecarHandler().extract(src)
+
+
+def test_verify_sidecar(tmp_path: Path, sample_manifest: Manifest) -> None:
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    handler = SidecarHandler()
+    handler.embed(src, sample_manifest)
+    assert handler.verify(src)
+
+
+def test_extract_missing_sidecar(tmp_path: Path) -> None:
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    handler = SidecarHandler()
+    with pytest.raises(EmbeddingError, match="No sidecar file"):
+        handler.extract(src)
+
+
+def test_embed_full_mode_private_prompt_raises(tmp_path: Path, sample_manifest: Manifest) -> None:
+    """Sidecar embed must propagate the ManifestError from to_embed_json
+    when full-mode redaction would desync hash from payload.
+
+    Users who want redaction must switch to embed_mode='pointer' — see
+    test_pointer_sidecar_embed_and_extract.
+    """
+    import pytest
+    from genblaze_core.exceptions import ManifestError
+    from genblaze_core.models.enums import PromptVisibility
+
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    policy = EmbedPolicy(prompt_visibility=PromptVisibility.PRIVATE)
+    handler = SidecarHandler()
+    with pytest.raises(ManifestError, match="embed_mode='pointer'"):
+        handler.embed(src, sample_manifest, policy=policy)
+
+
+def test_pointer_sidecar_embed_and_extract(tmp_path: Path, sample_manifest: Manifest) -> None:
+    """Pointer-mode sidecar embeds URI-only JSON; extract raises PointerSidecarError."""
+    src = tmp_path / "image.png"
+    src.write_bytes(b"fake png")
+
+    sample_manifest.manifest_uri = "https://storage.example.com/manifest.json"
+    policy = EmbedPolicy(embed_mode="pointer")
+
+    handler = SidecarHandler()
+    sidecar = handler.embed(src, sample_manifest, policy=policy)
+
+    # Sidecar should contain only pointer fields
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert "run" not in data
+    assert data["manifest_uri"] == "https://storage.example.com/manifest.json"
+    assert "canonical_hash" in data
+
+    # Extract should raise PointerSidecarError
+    with pytest.raises(PointerSidecarError) as exc_info:
+        handler.extract(src)
+    assert exc_info.value.manifest_uri == "https://storage.example.com/manifest.json"
+    assert exc_info.value.canonical_hash == sample_manifest.canonical_hash
